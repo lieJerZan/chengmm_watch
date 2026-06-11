@@ -1,0 +1,1895 @@
+<template>
+  <div class="{{ faceClass }}" onclick="onFaceTap">
+    <div class="{{ timeBlockClass }}">
+      <text class="date">{{ dateText }}</text>
+      <div class="time-row">
+        <image class="{{ hourTensClass }}" src="{{ hourTensImg }}" />
+        <image class="{{ hourOnesClass }}" src="{{ hourOnesImg }}" />
+        <text class="time-colon">:</text>
+        <image class="{{ minuteTensClass }}" src="{{ minuteTensImg }}" />
+        <image class="{{ minuteOnesClass }}" src="{{ minuteOnesImg }}" />
+      </div>
+    </div>
+
+    <div class="{{ centerRowClass }}">
+      <div class="{{ leftMetricClass }}">
+        <image class="metric-icon" src="./assets/icon-steps.png" />
+        <text class="metric-value">{{ stepText }}</text>
+      </div>
+
+      <div class="pet-stage">
+        <div class="{{ bubbleClass }}">
+          <text class="bubble-text">{{ talk }}</text>
+        </div>
+        <image class="pet-img" src="{{ petImage }}" onclick="onPetTap" />
+      </div>
+
+      <div class="{{ rightMetricClass }}">
+        <image class="metric-icon" src="./assets/icon-heart.png" />
+        <text class="metric-value">{{ heartText }}</text>
+      </div>
+    </div>
+
+    <div class="bottom-spacer"></div>
+
+    <div class="{{ batteryClass }}">
+      <image class="battery-icon" src="./assets/icon-battery.png" />
+      <text class="battery-value">{{ batteryText }}</text>
+    </div>
+
+    <!-- <text class="debug-line">{{ debugText }}</text> -->
+  </div>
+</template>
+
+<script>
+  import battery from '@system.battery'
+  import health from '@blueos.health.health'
+  import screen from '@blueos.hardware.display.screen'
+  import brightness from '@blueos.hardware.display.brightness'
+  import eventManager from '@blueos.app.event.eventManager'
+
+  function safeRequire(name) {
+    try {
+      if (typeof require === 'function') {
+        const mod = require(name)
+        if (typeof console !== 'undefined' && console.log) {
+          console.log('CMM_WF require ok ' + name)
+        }
+        return mod
+      }
+    } catch (e) {
+      if (typeof console !== 'undefined' && console.log) {
+        console.log(
+          'CMM_WF require fail ' +
+            name +
+            ' ' +
+            String(e && e.message ? e.message : e)
+        )
+      }
+    }
+    return null
+  }
+
+  const lines = [
+    '今天适合慢慢发光。',
+    '橙码码在守护你的时间。',
+    '走几步，像素也会开心。',
+    '先把今天运行起来。',
+    '嘘，我刚偷偷刷新好运。',
+  ]
+
+  export default {
+    data() {
+      return {
+        // ===== 定时器/订阅句柄区 =====
+        // timerId：每秒刷新时间；petTimerId：宠物待机动画；vitalTimerId：电量轮询。
+        // BlueOS 表盘生命周期可能会反复进入/离开，所有定时器都要在 onDestroy 清掉。
+        timerId: -1,
+        petTimerId: -1,
+        bubbleTimerId: -1,
+        vitalTimerId: -1,
+        wakeTimerId: -1,
+        bootTimerId: -1,
+        // 低功耗预备态定时器：
+        // BlueOS 真机进入 AOD/息屏后，JS 可能被系统冻结，届时再切 UI 已经来不及。
+        // 所以这里不是“等息屏后再切”，而是在系统自动熄屏前提前把最后一帧换成简版表盘。
+        screenOffTimerId: -1,
+        // 屏幕亮度轮询兜底：
+        // 部分真机不一定稳定派发 SCREEN_OFF/SCREEN_AOD，用亮度低于阈值辅助判断进入息屏样式。
+        brightnessPollTimerId: -1,
+        // 步数首屏兜底请求的延迟计时器：主请求没拿到数据时再用常量方式请求一次。
+        stepFallbackTimerId: -1,
+        // 单次互动动画会创建一串 setTimeout，这里统一保存，方便新动画开始前清理旧帧。
+        frameTimerIds: [],
+        // 系统事件订阅 id，例如息屏/亮屏/电量变化事件；销毁时需要逐个 unsubscribe。
+        eventIds: [],
+        // 健康数据订阅状态；BlueOS 表盘 onShow 可能多次触发，用它避免重复订阅。
+        healthSubscribed: false,
+        // 亮度监听用于兜底识别亮屏恢复。SCREEN_ON 在真机表盘场景里可能不会稳定触发。
+        brightnessSubscribed: false,
+        // ===== 样式 class 状态区 =====
+        // 通过替换 class 控制普通模式/睡眠模式、左右指标隐藏、电量隐藏等 UI 状态。
+        faceClass: 'face',
+        timeBlockClass: 'time-block',
+        centerRowClass: 'center-row',
+        leftMetricClass: 'side-metric metric-left',
+        rightMetricClass: 'side-metric metric-right',
+        batteryClass: 'battery-pill',
+
+        // ===== 时间显示资源区 =====
+        // 时间数字不是普通文本，而是由本地数字图片拼出来，所以每一位都要单独保存图片路径。
+        hourTensImg: './assets/digit-solid-0.png',
+        hourOnesImg: './assets/digit-outline-0.png',
+        minuteTensImg: './assets/digit-solid-0.png',
+        minuteOnesImg: './assets/digit-outline-0.png',
+        hourTensClass: 'time-digit time-digit-solid',
+        hourOnesClass: 'time-digit-outline',
+        minuteTensClass: 'time-digit time-digit-solid',
+        minuteOnesClass: 'time-digit-outline',
+        dateText: '06/05 FRI',
+
+        // ===== 手表真实数据区 =====
+        // 电量、步数、心率会被 BlueOS API 更新；-- 表示还没有拿到真实数据。
+        batteryText: '86%',
+        stepText: '--',
+        heartText: '--',
+        // debugText 暂时用于真机排查，稳定后可以隐藏或删除模板里的 debug-line。
+        debugText: 'battery dbg boot',
+
+        // ===== 宠物互动/动画状态区 =====
+        moodText: '发光',
+        // 当前宠物图片帧；点击/待机/睡眠/惊醒都会切换这个路径。
+        petImage: './assets/pet-idle.png',
+        // frameIndex 用来让待机动画隔一段时间自动切换/随机触发互动。
+        frameIndex: 0,
+        // isPlaying：正在播放一次完整互动动画。
+        // isSleeping：当前 UI 是否已经切到简版/AOD 样式；它不等于 onHide，离开表盘前台不能直接置为 true。
+        isPlaying: false,
+        talk: '',
+        bubbleClass: 'bubble bubble-hidden',
+        // lineIndex 用来循环展示互动文案；lastMode 用来避免随机动画连续重复。
+        lineIndex: 0,
+        lastMode: -1,
+        isSleeping: false,
+        // minuteKey 用来避免同一分钟里重复刷新时间图片，降低不必要的资源切换。
+        minuteKey: '',
+        screenMode: 'normal',
+        // screenOffMs 是系统设置的自动熄屏时间，读不到时按用户当前实测的 5 秒兜底。
+        // 这个值只用于“提前准备最后一帧”，不是用来证明当前已经息屏。
+        screenOffMs: 5000,
+        // 记录最后一次亮度，便于日志排查息屏/亮屏判断是否命中。
+        lastBrightnessValue: -1,
+        // 熄屏前提前多少毫秒尝试切到低功耗预备态。
+        // 到点后还会再读一次亮度，避免屏幕仍然亮着时误切成 AOD 样式。
+        ambientLeadMs: 250,
+        // 亮度兜底门槛：部分真机 AOD/低功耗显示不是 0 亮度，所以低亮度也按息屏态处理。
+        ambientBrightnessThreshold: 8,
+        // 如果预切倒计时到了但屏幕仍然是亮的，就短间隔重试，而不是立刻切简版。
+        ambientRetryMs: 600,
+      }
+    },
+
+    onInit() {
+      this.refreshTime()
+      this.startPetIdle()
+      this.batteryTrace('@system typeof ' + typeof battery)
+      this.batteryTrace(
+        'import api ' + (battery ? this.describeApi(battery) : 'null')
+      )
+      this.trace(
+        'screen api',
+        screen ? this.describeApi(screen) : 'screen module null'
+      )
+
+      const self = this
+      // 表盘刚进入时稍等一下再读系统数据，避免部分 BlueOS API 初始化还没完成。
+      this.bootTimerId = setTimeout(function () {
+        self.refreshScreenConfig()
+        self.getBatteryStatus()
+        self.refreshHealth()
+        self.startHealthSubscriptions()
+        self.startBrightnessMonitor()
+        self.startBrightnessPoll()
+        self.startScreenEvents()
+        // 关键：启动后立刻安排一次预切。
+        // 如果用户停留在表盘直到系统自动熄屏，最后一帧会提前变成 AOD 简版样式。
+        self.scheduleAmbientPrepare('boot')
+      }, 800)
+      this.timerId = setInterval(function () {
+        self.refreshTime()
+      }, 1000)
+      // 电量不是订阅接口，当前采用 30 秒轮询一次；电量事件只作为额外兜底。
+      this.vitalTimerId = setInterval(function () {
+        self.getBatteryStatus()
+      }, 30000)
+    },
+
+    onDestroy() {
+      // 表盘销毁时清掉所有定时器和订阅，防止再次进入后回调重复触发。
+      clearInterval(this.timerId)
+      clearInterval(this.petTimerId)
+      clearTimeout(this.bubbleTimerId)
+      clearTimeout(this.wakeTimerId)
+      clearTimeout(this.bootTimerId)
+      clearTimeout(this.screenOffTimerId)
+      clearTimeout(this.stepFallbackTimerId)
+      clearInterval(this.vitalTimerId)
+      this.clearFrameTimers()
+      this.stopHealthSubscriptions()
+      this.stopBrightnessMonitor()
+      this.stopBrightnessPoll()
+      this.stopScreenEvents()
+    },
+
+    onShow() {
+      this.wakeUpPet()
+      // 回到表盘前台时恢复完整表盘：
+      // 从应用/设置页返回也会走 onShow，这种场景不是息屏，所以必须主动 enterActiveMode。
+      this.refreshHealth()
+      this.startHealthSubscriptions()
+      this.startBrightnessMonitor()
+      this.startBrightnessPoll()
+      this.refreshScreenConfig()
+      this.enterActiveMode('show')
+    },
+
+    onHide() {
+      // 表盘离开前台后停止健康订阅，省电，也避免后台继续刷数据。
+      // 进入其他应用/设置不等于息屏，所以这里不能切睡眠样式；否则返回表盘会先看到息屏页。
+      this.stopHealthSubscriptions()
+      this.stopBrightnessMonitor()
+      this.stopBrightnessPoll()
+      this.clearPreSleepTimer()
+    },
+
+    refreshTime() {
+      const now = new Date()
+      const hour = this.pad(now.getHours())
+      const minute = this.pad(now.getMinutes())
+      const minuteKey = hour + ':' + minute
+      // 时间图片每分钟变化一次即可；秒级 onInit 定时器只负责及时跨分钟刷新。
+      if (minuteKey === this.minuteKey) {
+        return
+      }
+      this.minuteKey = minuteKey
+
+      const month = this.pad(now.getMonth() + 1)
+      const day = this.pad(now.getDate())
+      const week = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'][
+        now.getDay()
+      ]
+
+      this.applyTimeImages(hour, minute)
+      this.dateText = month + '/' + day + ' ' + week
+    },
+
+    applyTimeImages(hour, minute) {
+      // 息屏/AOD 模式下四位时间都用空心数字，亮屏才恢复“十位实心、个位空心”的样式。
+      if (this.isSleeping) {
+        this.hourTensImg = './assets/digit-outline-' + hour.charAt(0) + '.png'
+        this.hourOnesImg = './assets/digit-outline-' + hour.charAt(1) + '.png'
+        this.minuteTensImg =
+          './assets/digit-outline-' + minute.charAt(0) + '.png'
+        this.minuteOnesImg =
+          './assets/digit-outline-' + minute.charAt(1) + '.png'
+        this.hourTensClass = 'time-digit-sleep'
+        this.hourOnesClass = 'time-digit-sleep'
+        this.minuteTensClass = 'time-digit-sleep'
+        this.minuteOnesClass = 'time-digit-sleep'
+        return
+      }
+
+      this.hourTensImg = './assets/digit-solid-' + hour.charAt(0) + '.png'
+      this.hourOnesImg = './assets/digit-outline-' + hour.charAt(1) + '.png'
+      this.minuteTensImg = './assets/digit-solid-' + minute.charAt(0) + '.png'
+      this.minuteOnesImg = './assets/digit-outline-' + minute.charAt(1) + '.png'
+      this.hourTensClass = 'time-digit time-digit-solid'
+      this.hourOnesClass = 'time-digit-outline'
+      this.minuteTensClass = 'time-digit time-digit-solid'
+      this.minuteOnesClass = 'time-digit-outline'
+    },
+
+    startScreenEvents() {
+      // 优先使用官方事件模块 @blueos.app.event.eventManager；旧 require 名只做兜底。
+      const events = eventManager || safeRequire('@blueos.app.event')
+      if (!events || !events.subscribe) {
+        this.trace('screen event api null')
+        return
+      }
+
+      const self = this
+      // 真实系统事件仍然要监听：
+      // SCREEN_OFF/SCREEN_AOD 到来时直接切简版；SCREEN_ON 到来时恢复完整表盘。
+      // 但不能完全依赖它们，因为真机进入 AOD 后 JS 可能已经暂停，所以还需要 scheduleAmbientPrepare 预切。
+      this.subscribeScreenEvent(events, 'usual.event.SCREEN_OFF', function () {
+        self.trace('event SCREEN_OFF')
+        self.clearPreSleepTimer()
+        self.enterSleepMode('screen-off')
+      })
+      this.subscribeScreenEvent(events, 'usual.event.SCREEN_AOD', function () {
+        self.trace('event SCREEN_AOD')
+        self.clearPreSleepTimer()
+        self.enterSleepMode('aod')
+      })
+      this.subscribeScreenEvent(events, 'usual.event.SCREEN_ON', function () {
+        self.trace('event SCREEN_ON')
+        self.enterActiveMode('screen-on')
+      })
+      this.subscribeScreenEvent(
+        events,
+        'usual.event.BATTERY_CHANGED',
+        function (data) {
+          // 电量变化事件如果有返回数据，就直接更新；30 秒轮询仍然作为兜底。
+          self.applyBatteryStatus(self.pickPayload(data))
+        }
+      )
+      this.subscribeScreenEvent(
+        events,
+        'usual.event.CHARGING',
+        function (data) {
+          self.applyBatteryStatus(self.pickPayload(data))
+        }
+      )
+      this.subscribeScreenEvent(
+        events,
+        'usual.event.DISCHARGING',
+        function (data) {
+          self.applyBatteryStatus(self.pickPayload(data))
+        }
+      )
+    },
+
+    subscribeScreenEvent(events, eventName, callback) {
+      try {
+        // 记录 subscribe 返回的 id，stopScreenEvents 里按 id 退订。
+        const id = events.subscribe({
+          eventName: eventName,
+          callback,
+        })
+        if (typeof id === 'number') {
+          this.eventIds.push(id)
+        }
+      } catch (e) {
+        this.trace('screen event sub catch', {
+          eventName: eventName,
+          error: e && e.message ? e.message : String(e),
+        })
+      }
+    },
+
+    stopScreenEvents() {
+      const events = eventManager || safeRequire('@blueos.app.event')
+      if (!events || !events.unsubscribe) {
+        return
+      }
+
+      for (let i = 0; i < this.eventIds.length; i++) {
+        try {
+          // 官方建议 event.unsubscribe 传 { id }，不要直接传数字。
+          events.unsubscribe({ id: this.eventIds[i] })
+        } catch (e) {}
+      }
+      this.eventIds = []
+    },
+
+    refreshVitals() {
+      // 旧的统一刷新入口：现在主要给兼容保留；实际定时器只轮询电量，健康靠订阅。
+      this.getBatteryStatus()
+      this.refreshHealth()
+    },
+
+    refreshScreenConfig() {
+      // 读取系统自动熄屏时间和 AOD 开关状态。
+      // getScreenOffTime：用于计算“提前多久切最后一帧”。
+      // getAodStatus：只表示用户是否开启 AOD，不表示当前正在 AOD，不能拿它做当前状态判断。
+      if (!screen) {
+        this.trace('screen module null')
+        return
+      }
+
+      try {
+        if (screen.getScreenOffTime) {
+          const rawOffTime = screen.getScreenOffTime()
+          const offMs = this.normalizeScreenOffTime(rawOffTime)
+          if (offMs > 0) {
+            this.screenOffMs = offMs
+          }
+          this.trace('screen off time', {
+            raw: rawOffTime,
+            ms: this.screenOffMs,
+          })
+        } else {
+          this.trace('screen no getScreenOffTime')
+        }
+      } catch (e) {
+        this.trace(
+          'screen off catch',
+          e && e.message ? e.message : String(e)
+        )
+      }
+
+      try {
+        if (screen.getAodStatus) {
+          this.trace('screen aod status', screen.getAodStatus())
+        }
+      } catch (e) {
+        this.trace('screen aod catch', e && e.message ? e.message : String(e))
+      }
+    },
+
+    normalizeScreenOffTime(value) {
+      // getScreenOffTime 不同系统可能返回秒或毫秒：5 表示 5 秒，5000 表示 5000 毫秒。
+      const numberValue = this.pickValueNumber(value)
+      if (numberValue === null || numberValue <= 0) {
+        return 0
+      }
+      if (numberValue <= 60) {
+        return Math.round(numberValue * 1000)
+      }
+      return Math.round(numberValue)
+    },
+
+    clearPreSleepTimer() {
+      // 清掉低功耗预备态定时器。返回前台、点击、销毁时都要清，避免旧回调乱切 UI。
+      clearTimeout(this.screenOffTimerId)
+      this.screenOffTimerId = -1
+    },
+
+    scheduleAmbientPrepare(reason) {
+      // 正确思路：
+      // 1. 不强求拿到一个“绝对准确的息屏瞬间”。
+      // 2. 利用 getScreenOffTime 算出系统大概什么时候自动熄屏。
+      // 3. 在熄屏前 ambientLeadMs 毫秒尝试切到简版样式。
+      // 4. 到点后先读亮度：仍然亮着就延后重试，已经低亮度/读不到亮度才切简版。
+      // 5. 如果之后 SCREEN_ON/亮度恢复/onShow 到来，再切回完整表盘。
+      if (this.isSleeping) {
+        return
+      }
+
+      this.clearPreSleepTimer()
+      const offMs = this.screenOffMs > 0 ? this.screenOffMs : 5000
+      const delay = Math.max(1000, offMs - this.ambientLeadMs)
+      const self = this
+      this.trace('ambient prepare schedule', { reason: reason, delay: delay })
+      this.screenOffTimerId = setTimeout(function () {
+        if (self.isPlaying) {
+          // 互动动画没播完时先不硬切，避免宠物动作被截断；动画结束后重新安排预切。
+          self.scheduleAmbientPrepare('wait-animation')
+          return
+        }
+        const brightnessValue = self.readBrightnessValue()
+        if (
+          brightnessValue !== null &&
+          brightnessValue > self.ambientBrightnessThreshold
+        ) {
+          self.trace('ambient prepare skip bright', {
+            value: brightnessValue,
+          })
+          self.scheduleAmbientPrepareSoon('still-bright')
+          return
+        }
+        self.enterSleepMode('ambient-prepare')
+      }, delay)
+    },
+
+    scheduleAmbientPrepareSoon(reason) {
+      // 预切倒计时到了但屏幕仍然亮着时使用短间隔重试。
+      // 不能重新等完整 screenOffMs，否则可能错过真正熄屏前的最后刷新机会。
+      if (this.isSleeping) {
+        return
+      }
+
+      this.clearPreSleepTimer()
+      const self = this
+      this.trace('ambient prepare retry', {
+        reason: reason,
+        delay: this.ambientRetryMs,
+      })
+      this.screenOffTimerId = setTimeout(function () {
+        if (self.isPlaying) {
+          self.scheduleAmbientPrepareSoon('wait-animation')
+          return
+        }
+        const brightnessValue = self.readBrightnessValue()
+        if (
+          brightnessValue !== null &&
+          brightnessValue > self.ambientBrightnessThreshold
+        ) {
+          self.scheduleAmbientPrepareSoon('still-bright')
+          return
+        }
+        self.enterSleepMode('ambient-prepare-retry')
+      }, this.ambientRetryMs)
+    },
+
+    readBrightnessValue() {
+      // 读取当前亮度用于判断“预切倒计时到了但屏幕是否仍然亮着”。
+      // 返回 null 表示无法读取：这种情况下继续允许预切，保留原本确保最后一帧正确的能力。
+      if (!brightness || !brightness.getValueSync) {
+        return null
+      }
+
+      try {
+        const value = this.pickValueNumber(brightness.getValueSync())
+        if (value !== null) {
+          this.lastBrightnessValue = value
+        }
+        return value
+      } catch (e) {
+        this.trace(
+          'brightness read catch',
+          e && e.message ? e.message : String(e)
+        )
+      }
+      return null
+    },
+
+    startBrightnessMonitor() {
+      // 亮度变化比 SCREEN_ON 更接近真实“亮屏”动作：亮屏后 value 往往会从 0/低值变成正常亮度。
+      if (this.brightnessSubscribed) {
+        return
+      }
+      if (!brightness || !brightness.subscribe) {
+        this.trace('brightness subscribe null')
+        return
+      }
+
+      const self = this
+      try {
+        brightness.subscribe({
+          callback(data) {
+            const value = self.pickValueNumber(data)
+            self.trace('brightness change', data)
+            self.applyBrightnessState(value, 'brightness-sub')
+          },
+          fail(data, code) {
+            self.trace('brightness sub fail', { code: code, data: data })
+          },
+        })
+        this.brightnessSubscribed = true
+        this.trace('brightness subscribed')
+      } catch (e) {
+        this.trace(
+          'brightness sub catch',
+          e && e.message ? e.message : String(e)
+        )
+      }
+    },
+
+    stopBrightnessMonitor() {
+      if (!this.brightnessSubscribed) {
+        return
+      }
+      if (!brightness || !brightness.unsubscribe) {
+        this.brightnessSubscribed = false
+        return
+      }
+      try {
+        brightness.unsubscribe()
+        this.trace('brightness unsubscribed')
+      } catch (e) {
+        this.trace(
+          'brightness unsub catch',
+          e && e.message ? e.message : String(e)
+        )
+      }
+      this.brightnessSubscribed = false
+    },
+
+    stopBrightnessPoll() {
+      if (this.brightnessPollTimerId === -1) {
+        return
+      }
+      clearInterval(this.brightnessPollTimerId)
+      this.brightnessPollTimerId = -1
+      this.trace('brightness poll stopped')
+    },
+
+    startBrightnessPoll() {
+      // 亮度轮询只是辅助，不是主流程。
+      // 主流程靠“预切最后一帧 + 系统事件恢复”；亮度只负责补漏：
+      // 亮度降到阈值以内时切简版，亮度恢复时切回完整表盘。
+      if (this.brightnessPollTimerId !== -1) {
+        return
+      }
+      if (!brightness || !brightness.getValueSync) {
+        this.trace('brightness sync null')
+        return
+      }
+
+      const self = this
+      this.brightnessPollTimerId = setInterval(function () {
+        try {
+          const value = brightness.getValueSync()
+          self.applyBrightnessState(value, 'brightness-poll')
+        } catch (e) {
+          self.trace(
+            'brightness poll catch',
+            e && e.message ? e.message : String(e)
+          )
+        }
+      }, 1000)
+      this.trace('brightness poll started')
+    },
+
+    applyBrightnessState(value, source) {
+      if (value === null || typeof value === 'undefined') {
+        return
+      }
+
+      const numberValue = Number(value)
+      if (isNaN(numberValue)) {
+        return
+      }
+
+      // 只在亮度变化时打日志，避免 1 秒轮询刷太多。
+      const brightnessChanged = numberValue !== this.lastBrightnessValue
+      if (brightnessChanged) {
+        this.lastBrightnessValue = numberValue
+        this.trace('brightness state', { source: source, value: numberValue })
+      }
+
+      if (
+        numberValue <= this.ambientBrightnessThreshold &&
+        !this.isSleeping
+      ) {
+        // 有些机型 AOD 仍有很低亮度，不一定是 0，所以用阈值判断。
+        this.enterSleepMode(source + '-off')
+        return
+      }
+
+      if (numberValue > this.ambientBrightnessThreshold && this.isSleeping) {
+        // 亮度恢复通常说明抬腕/点亮屏幕了，立刻恢复完整表盘。
+        this.enterActiveMode(source + '-on')
+        return
+      }
+
+      if (
+        numberValue > 0 &&
+        !this.isSleeping &&
+        (brightnessChanged || this.screenOffTimerId === -1)
+      ) {
+        // 亮屏状态下重新安排下一次预切，避免用户交互后仍沿用旧的倒计时。
+        this.scheduleAmbientPrepare(source + '-active')
+      }
+    },
+
+    getBatteryStatus() {
+      // 当前项目仍使用 @system.battery，因为前面真机验证它能拿到电量。
+      // 如果以后切到 @blueos.hardware.battery，manifest 里的 feature 也要同步调整。
+      this.batteryTrace('getStatus start')
+      if (!battery) {
+        this.batteryTrace('module null')
+        return
+      }
+
+      try {
+        this.batteryTrace('api ' + this.describeApi(battery))
+        const self = this
+        if (battery.getStatus) {
+          // getStatus 是异步读一次，不是订阅；所以外层用 30 秒 setInterval 轮询。
+          battery.getStatus({
+            success(data) {
+              self.batteryTrace('success ' + self.safeStringify(data))
+              self.applyBatteryStatus(data)
+            },
+            fail(errCode, errMsg) {
+              self.batteryTrace(
+                'fail code=' +
+                  self.safeStringify(errCode) +
+                  ' msg=' +
+                  self.safeStringify(errMsg)
+              )
+            },
+            complete() {
+              self.batteryTrace('complete')
+            },
+          })
+        } else {
+          this.batteryTrace('no getStatus api=' + this.describeApi(battery))
+        }
+      } catch (e) {
+        this.batteryTrace('catch ' + (e && e.message ? e.message : String(e)))
+      }
+    },
+
+    applyBatteryStatus(data) {
+      // 电量回调可能是 { level }、{ batteryLevel }，也可能事件包里套了一层 data/value。
+      const value = this.pickNumber(data)
+      if (value === null) {
+        this.batteryTrace('no number ' + this.safeStringify(data))
+        return
+      }
+
+      let level = value
+      // 不同电量 API 可能返回 0-1 或 0-100，这里统一转换成百分比显示。
+      if (level <= 1) {
+        level = Math.round(level * 100)
+      } else {
+        level = Math.round(level)
+      }
+      this.batteryText = this.clamp(level, 0, 100) + '%'
+      this.batteryTrace('set ' + this.batteryText)
+    },
+
+    refreshHealth() {
+      // 健康首屏刷新：读一次最近心率 + 今日步数，让 UI 不必等订阅下一次推送。
+      this.trace('health start')
+      if (!health) {
+        this.trace('health module null')
+        return
+      }
+
+      this.trace('health api', this.describeApi(health))
+      // 打印常量表是为了确认真机上 HEART_RATE/STEP_COUNT/SUM 的实际枚举值。
+      this.trace('health dataTypes', health.DATA_TYPES || 'no DATA_TYPES')
+      this.trace(
+        'health statTypes',
+        health.STATISTIC_TYPES || 'no STATISTIC_TYPES'
+      )
+      // 首屏先读一次最近心率和今日步数；后续更新主要依赖 subscribeSample。
+      this.refreshHealthSamples(health)
+      this.refreshTodaySteps(health)
+    },
+
+    startHealthSubscriptions() {
+      // 订阅只启动一次；onShow/onInit 都会调用，所以必须防重复。
+      if (this.healthSubscribed) {
+        return
+      }
+      if (!health || !health.subscribeSample) {
+        this.trace('health subscribeSample null')
+        return
+      }
+
+      const heartType = this.getHealthType(health, 'HEART_RATE')
+      const stepType = this.getHealthType(health, 'STEP_COUNT')
+      const self = this
+      try {
+        // 心率是采样数据，手表有新采样时会从这里推送过来。
+        health.subscribeSample({
+          // dataType 使用运行时常量，不手写 0/5，避免以后系统枚举变化。
+          dataType: heartType,
+          callback(data) {
+            // 订阅回调里的 data 可能是 { value }，也可能是 { data: { value } }。
+            self.trace('heart sub', data)
+            self.applyHeartSamples(data, heartType)
+          },
+          fail(data, code) {
+            self.trace('heart sub fail', { code: code, data: data })
+          },
+        })
+        // 你实测 STEP_COUNT 也能通过 subscribeSample 推送，这里直接用订阅更新左侧步数。
+        // 如果某些机型不推送步数，refreshTodaySteps 仍会在打开表盘时读一次今日统计。
+        health.subscribeSample({
+          dataType: stepType,
+          callback(data) {
+            self.trace('steps sub', data)
+            self.applyStepSamples(data, stepType)
+          },
+          fail(data, code) {
+            self.trace('steps sub fail', { code: code, data: data })
+          },
+        })
+        this.healthSubscribed = true
+        this.trace('health subscribed')
+      } catch (e) {
+        this.trace(
+          'health subscribe catch',
+          e && e.message ? e.message : String(e)
+        )
+      }
+    },
+
+    stopHealthSubscriptions() {
+      // BlueOS 表盘切走时不一定立刻销毁，所以 onHide/onDestroy 都会走退订兜底。
+      if (!this.healthSubscribed) {
+        return
+      }
+      if (!health || !health.unsubscribeSample) {
+        // 如果接口不存在，也要把本地状态复位，否则下次 onShow 会以为还订阅着。
+        this.healthSubscribed = false
+        return
+      }
+
+      try {
+        // unsubscribeSample 按 dataType 取消对应采样订阅。
+        health.unsubscribeSample({
+          dataType: this.getHealthType(health, 'HEART_RATE'),
+        })
+      } catch (e) {
+        this.trace('heart unsub catch', e && e.message ? e.message : String(e))
+      }
+      try {
+        health.unsubscribeSample({
+          dataType: this.getHealthType(health, 'STEP_COUNT'),
+        })
+      } catch (e) {
+        this.trace('steps unsub catch', e && e.message ? e.message : String(e))
+      }
+      this.healthSubscribed = false
+      this.trace('health unsubscribed')
+    },
+
+    refreshHealthSamples(health) {
+      // getRecentSamples 是“查询最近一次采样”，不是持续订阅。
+      // 这里用于刚打开表盘时立即显示一个心率值，订阅后续会继续刷新。
+      if (!health.getRecentSamples) {
+        this.trace('heart no getRecentSamples')
+        return
+      }
+
+      const self = this
+      try {
+        const heartType = this.getHealthType(health, 'HEART_RATE')
+        this.trace('heart request', { dataType: [heartType] })
+        // 一次性读取最近心率，主要用于表盘刚打开、订阅还没推送前的首屏显示。
+        health.getRecentSamples({
+          // common 文档/本地类型声明使用 dataType: [type]，之前 dataTypes 是另一份文档的写法。
+          dataType: [heartType],
+          success() {
+            // 这里不要只信 res。BlueOS 某些回调会把数据放到第 2 个参数，所以读取 arguments。
+            const args = self.argsToArray(arguments)
+            const data = self.pickCallbackData(args)
+            self.trace('heart success args', args)
+            self.trace('heart success', data)
+            if (!self.applyHeartSamples(data, heartType)) {
+              self.refreshHealthSamplesFallback(health, heartType)
+            }
+          },
+          fail(data, code) {
+            self.trace('heart fail', { code: code, data: data })
+            self.refreshHealthSamplesFallback(health, heartType)
+          },
+          complete() {
+            self.trace('heart complete')
+          },
+        })
+      } catch (e) {
+        this.trace('heart catch', e && e.message ? e.message : String(e))
+      }
+    },
+
+    refreshHealthSamplesFallback(health, heartType) {
+      const self = this
+      try {
+        // 兼容另一套文档里的 dataTypes 写法；主路径失败/解析失败才会走到这里。
+        this.trace('heart fallback request', { dataTypes: [heartType] })
+        health.getRecentSamples({
+          dataTypes: [heartType],
+          success() {
+            const args = self.argsToArray(arguments)
+            const data = self.pickCallbackData(args)
+            self.trace('heart fallback args', args)
+            self.trace('heart fallback success', data)
+            self.applyHeartSamples(data, heartType)
+          },
+          fail() {
+            self.trace('heart fallback fail', self.argsToArray(arguments))
+          },
+        })
+      } catch (e) {
+        this.trace(
+          'heart fallback catch',
+          e && e.message ? e.message : String(e)
+        )
+      }
+    },
+
+    refreshTodaySteps(health) {
+      // 步数更像统计数据，首屏用 getTodayStatistic 查询“今天累计步数”。
+      // 后续若 subscribeSample 推送 STEP_COUNT，就直接从订阅回调更新。
+      if (!health.getTodayStatistic) {
+        this.trace('steps no getTodayStatistic')
+        return
+      }
+
+      const self = this
+      const stepType = this.getHealthType(health, 'STEP_COUNT')
+      // 主路径先用字符串 SUM，因为 common 类型声明里 statisticType 是 string。
+      const totalType = 'SUM'
+      try {
+        clearTimeout(this.stepFallbackTimerId)
+        this.trace('steps request', {
+          dataType: stepType,
+          statisticType: totalType,
+        })
+        health.getTodayStatistic({
+          dataType: stepType,
+          statisticType: totalType,
+          success() {
+            // 同样读取完整 arguments，避免不同运行时回调参数位置不一致。
+            const args = self.argsToArray(arguments)
+            const data = self.pickCallbackData(args)
+            self.trace('steps success args', args)
+            self.trace('steps success', data)
+            const value = self.pickStatisticValue(data, stepType, totalType)
+            if (value !== null) {
+              self.stepText = self.formatCount(value)
+              self.trace('steps set', self.stepText)
+            } else {
+              self.trace('steps no number')
+              self.refreshTodayStepsFallback(health)
+            }
+          },
+          fail(data, code) {
+            self.trace('steps fail', { code: code, data: data })
+            self.refreshTodayStepsFallback(health)
+          },
+          complete() {
+            self.trace('steps complete')
+          },
+        })
+        // 有些机型 statisticType 只接受常量值，不接受 'SUM' 字符串；短暂等待后自动兜底。
+        this.stepFallbackTimerId = setTimeout(function () {
+          if (self.stepText === '--') {
+            self.refreshTodayStepsFallback(health)
+          }
+        }, 1200)
+      } catch (e) {
+        this.trace('steps catch', e && e.message ? e.message : String(e))
+      }
+    },
+
+    refreshTodayStepsFallback(health) {
+      // 统计兜底路径：部分真机更喜欢 health.STATISTIC_TYPES.SUM 这个数字常量。
+      if (!health.getTodayStatistic) {
+        return
+      }
+
+      const self = this
+      const stepType = this.getHealthType(health, 'STEP_COUNT')
+      const totalType = this.getStatisticType(health, 'SUM')
+      try {
+        // 兜底路径：使用 health.STATISTIC_TYPES.SUM，部分真机返回的是数字常量 1。
+        this.trace('steps fallback request', {
+          dataType: stepType,
+          statisticType: totalType,
+        })
+        health.getTodayStatistic({
+          dataType: stepType,
+          statisticType: totalType,
+          success() {
+            const args = self.argsToArray(arguments)
+            const data = self.pickCallbackData(args)
+            self.trace('steps fallback args', args)
+            self.trace('steps fallback success', data)
+            const value = self.pickStatisticValue(data, stepType, totalType)
+            if (value !== null) {
+              self.stepText = self.formatCount(value)
+              self.trace('steps fallback set', self.stepText)
+            } else {
+              self.trace('steps fallback no number')
+            }
+          },
+          fail(data, code) {
+            self.trace('steps fallback fail', { code: code, data: data })
+          },
+        })
+      } catch (e) {
+        this.trace(
+          'steps fallback catch',
+          e && e.message ? e.message : String(e)
+        )
+      }
+    },
+
+    getHealthType(health, name) {
+      // 从 health.DATA_TYPES 里取枚举值，例如 HEART_RATE -> 0、STEP_COUNT -> 5。
+      // 如果模块没提供常量，就退回字符串，方便日志里继续暴露问题。
+      if (
+        health &&
+        health.DATA_TYPES &&
+        typeof health.DATA_TYPES[name] !== 'undefined'
+      ) {
+        return health.DATA_TYPES[name]
+      }
+      return name
+    },
+
+    getStatisticType(health, name) {
+      // 从 health.STATISTIC_TYPES 里取统计维度，例如 SUM -> 1。
+      if (
+        health &&
+        health.STATISTIC_TYPES &&
+        typeof health.STATISTIC_TYPES[name] !== 'undefined'
+      ) {
+        return health.STATISTIC_TYPES[name]
+      }
+      return name
+    },
+
+    typeNameFromDataType(health, dataType) {
+      // 把数字枚举反查成名字，主要给旧的 applyHealthData 兼容逻辑使用。
+      if (!health || !health.DATA_TYPES) {
+        return String(dataType || '').toUpperCase()
+      }
+
+      const keys = Object.keys(health.DATA_TYPES)
+      for (let i = 0; i < keys.length; i++) {
+        if (health.DATA_TYPES[keys[i]] === dataType) {
+          return keys[i].toUpperCase()
+        }
+      }
+      return String(dataType || '').toUpperCase()
+    },
+
+    applyHealthData(data, health) {
+      // 旧的通用健康数据解析函数，目前订阅路径主要走 applyHeartSamples/applyStepSamples。
+      // 暂时保留，便于以后如果一次性返回多个 dataType 时复用。
+      this.trace('health apply raw', data)
+      const items = data instanceof Array ? data : [data]
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i]
+        if (!item) {
+          continue
+        }
+
+        const type = this.typeNameFromDataType(
+          health,
+          this.firstDefined(item.dataType, item.type, item.name)
+        )
+        const value = this.pickNumber(this.pickPayload(item))
+        if (value === null) {
+          continue
+        }
+
+        if (type.indexOf('HEART') !== -1) {
+          this.heartText = String(Math.round(value))
+          this.trace('heart set', this.heartText)
+        } else if (type.indexOf('STEP') !== -1) {
+          this.stepText = this.formatCount(value)
+          this.trace('steps sample set', this.stepText)
+        }
+      }
+    },
+
+    applyHeartSamples(data, heartType) {
+      // subscribeSample 和 getRecentSamples 的返回结构不完全一致，统一交给 pickSampleValue 解析。
+      const value = this.pickSampleValue(data, heartType)
+      if (value === null) {
+        this.trace('heart no sample value')
+        return false
+      }
+
+      this.heartText = String(Math.round(value))
+      this.trace('heart set', this.heartText)
+      return true
+    },
+
+    applyStepSamples(data, stepType) {
+      // 步数订阅回调可能直接返回 { value }，也可能带 dataType/data.value。
+      const value = this.pickSampleValue(data, stepType)
+      if (value === null) {
+        this.trace('steps no sample value')
+        return false
+      }
+
+      this.stepText = this.formatCount(value)
+      this.trace('steps sample set', this.stepText)
+      return true
+    },
+
+    pickSampleValue(data, dataType) {
+      // 兼容采样数据的多种返回结构：单对象、数组、{ data: { value } }、{ value }。
+      const items = data instanceof Array ? data : [data]
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i]
+        if (!item) {
+          continue
+        }
+
+        const itemType = this.firstDefined(item.dataType, item.type, item.name)
+        // 有些订阅回调只给 value 不给 dataType；如果没给类型，就默认这是当前订阅的数据。
+        if (
+          typeof itemType !== 'undefined' &&
+          itemType !== null &&
+          !this.sameHealthKey(itemType, dataType)
+        ) {
+          continue
+        }
+
+        const payload = this.firstDefined(item.data, item.value, item)
+        const value = this.pickValueNumber(payload)
+        if (value !== null) {
+          return value
+        }
+      }
+      return null
+    },
+
+    pickStatisticValue(data, dataType, statisticType) {
+      // 解析 getTodayStatistic 返回的统计数据，优先匹配 dataType/statisticType，再取 value。
+      const items = data instanceof Array ? data : [data]
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i]
+        if (!item) {
+          continue
+        }
+
+        const itemDataType = this.firstDefined(
+          item.dataType,
+          item.type,
+          item.name
+        )
+        // 统计维度字段不同文档叫法不完全一致，这里把 statistic/statType 也算进去。
+        const itemStatisticType = this.firstDefined(
+          item.statisticType,
+          item.statistic,
+          item.statType
+        )
+        if (
+          !this.sameHealthKey(itemDataType, dataType) ||
+          !this.sameHealthKey(itemStatisticType, statisticType)
+        ) {
+          continue
+        }
+
+        const value = this.pickValueNumber(item)
+        if (value !== null) {
+          return value
+        }
+      }
+
+      // 如果返回结构没有带类型字段，最后再宽松地从整包数据里找 value。
+      return this.pickValueNumber(data)
+    },
+
+    pickValueNumber(value) {
+      // 在未知返回结构中递归寻找真正的数值字段，避开 dataType/statisticType 这类枚举字段。
+      if (typeof value === 'number' && !isNaN(value)) {
+        return value
+      }
+
+      if (value instanceof Array) {
+        for (let i = 0; i < value.length; i++) {
+          const picked = this.pickValueNumber(value[i])
+          if (picked !== null) {
+            return picked
+          }
+        }
+        return null
+      }
+
+      if (value && typeof value === 'object') {
+        const keys = [
+          'value',
+          'steps',
+          'step',
+          'count',
+          'heartRate',
+          'bpm',
+          'avg',
+          'total',
+          'data',
+          'result',
+          'list',
+          'records',
+          'samples',
+          'statistics',
+        ]
+        for (let i = 0; i < keys.length; i++) {
+          if (typeof value[keys[i]] !== 'undefined') {
+            const picked = this.pickValueNumber(value[keys[i]])
+            if (picked !== null) {
+              return picked
+            }
+          }
+        }
+      }
+
+      return null
+    },
+
+    sameHealthKey(left, right) {
+      // BlueOS 返回值可能是数字 5，也可能是字符串 '5'/'STEP_COUNT'；统一转字符串比较。
+      if (typeof left === 'undefined' || left === null) {
+        return false
+      }
+      if (typeof right === 'undefined' || right === null) {
+        return false
+      }
+      return String(left) === String(right)
+    },
+
+    argsToArray(args) {
+      // arguments 不是标准数组，先转成数组，后面才能 JSON.stringify 和遍历。
+      const result = []
+      for (let i = 0; i < args.length; i++) {
+        result.push(args[i])
+      }
+      return result
+    },
+
+    pickCallbackData(args) {
+      // 从 API 回调参数中挑最像真实数据的那个。
+      // 优先数组，其次对象，最后才是数字/字符串这种简单值。
+      if (!args || !args.length) {
+        return null
+      }
+
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] instanceof Array) {
+          return args[i]
+        }
+      }
+
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] && typeof args[i] === 'object') {
+          return args[i]
+        }
+      }
+
+      return args[0]
+    },
+
+    firstDefined(value1, value2, value3) {
+      // 类似空值合并：返回第一个不是 undefined/null 的值。
+      // 不能用 ||，因为 dataType=0 是合法值，|| 会误判成空。
+      if (typeof value1 !== 'undefined' && value1 !== null) {
+        return value1
+      }
+      if (typeof value2 !== 'undefined' && value2 !== null) {
+        return value2
+      }
+      return value3
+    },
+
+    pickPayload(value) {
+      // 系统事件经常会包一层 params/data/value；这里剥掉外层，只留下真正负载。
+      if (value && typeof value === 'object') {
+        if (typeof value.params !== 'undefined') {
+          return value.params
+        }
+        if (typeof value.data !== 'undefined') {
+          return value.data
+        }
+        if (typeof value.value !== 'undefined') {
+          return value.value
+        }
+      }
+      return value
+    },
+
+    pickNumber(value) {
+      // 通用取数函数：主要给电量和老逻辑用。
+      // 注意健康数据不要优先用它，否则可能误把 dataType=0 当成心率值。
+      if (typeof value === 'number' && !isNaN(value)) {
+        return value
+      }
+
+      if (value instanceof Array) {
+        for (let i = 0; i < value.length; i++) {
+          const picked = this.pickNumber(value[i])
+          if (picked !== null) {
+            return picked
+          }
+        }
+        return null
+      }
+
+      if (value && typeof value === 'object') {
+        const keys = [
+          'level',
+          'batteryLevel',
+          'percent',
+          'percentage',
+          'capacity',
+          'value',
+          'steps',
+          'step',
+          'count',
+          'heartRate',
+          'bpm',
+          'avg',
+          'total',
+        ]
+        for (let i = 0; i < keys.length; i++) {
+          if (typeof value[keys[i]] !== 'undefined') {
+            const picked = this.pickNumber(value[keys[i]])
+            if (picked !== null) {
+              return picked
+            }
+          }
+        }
+      }
+
+      return null
+    },
+
+    formatCount(value) {
+      // 步数显示格式化：超过一万时压缩成 1.2w，避免小表盘上文字太挤。
+      const count = Math.max(0, Math.round(value))
+      if (count >= 10000) {
+        return Math.floor(count / 1000) / 10 + 'w'
+      }
+      return String(count)
+    },
+
+    startPetIdle() {
+      // 宠物待机动画：每 975ms 在两张 idle 图之间切换，偶尔自动触发一次小互动。
+      const self = this
+      this.petTimerId = setInterval(function () {
+        if (self.isPlaying || self.isSleeping) {
+          return
+        }
+
+        self.frameIndex += 1
+        // 每 12 帧触发一次随机小动作；正在播放/睡眠时不打断当前状态。
+        if (self.frameIndex % 12 === 0) {
+          self.playRandomMoment()
+        } else {
+          self.petImage =
+            self.frameIndex % 2 === 0
+              ? './assets/pet-idle.png'
+              : './assets/pet-idle-up.png'
+        }
+      }, 975)
+    },
+
+    playRandomMoment() {
+      // 在 5 种互动动画里随机选一种。
+      if (this.isPlaying || this.isSleeping) {
+        return
+      }
+      this.playMoment(this.randomMode(5))
+    },
+
+    onPetTap() {
+      // 点击宠物：睡眠时先唤醒；普通状态下播放一次随机互动。
+      // 正在播放动画时忽略新的点击，避免多组 setTimeout 同时改 petImage 造成抽搐。
+      if (this.isPlaying) {
+        return
+      }
+      this.clearPreSleepTimer()
+      if (this.isSleeping) {
+        this.enterActiveMode('pet-tap')
+        return
+      }
+      this.playMoment(this.randomMode(5))
+      this.scheduleAmbientPrepare('pet-tap')
+    },
+
+    onFaceTap() {
+      // 有些真机场景亮屏时不触发 SCREEN_ON/onShow，页面会停留在预息屏样式。
+      // 给整个表盘做点击兜底：只要用户亮屏后点到表盘，就强制恢复普通前台状态。
+      if (this.isSleeping) {
+        this.trace('face tap wake')
+        this.enterActiveMode('face-tap')
+        return
+      }
+      this.scheduleAmbientPrepare('face-tap')
+    },
+
+    enterActiveMode(source) {
+      // 亮屏/抬腕/点击/返回表盘都统一从这里恢复完整表盘。
+      // 所有“回到正常显示”的入口都走这个函数，避免 SCREEN_ON、亮度恢复、onShow 各写一套逻辑。
+      // 如果此前在简版态，播放惊醒动画；如果本来就是 active，只刷新时间和重新安排预备态。
+      this.clearPreSleepTimer()
+      this.refreshScreenConfig()
+      if (this.isSleeping) {
+        this.wakeUpPet(source || 'active')
+      } else {
+        this.minuteKey = ''
+        this.refreshTime()
+        this.scheduleAmbientPrepare(source || 'active')
+      }
+    },
+
+    enterSleepMode(mode) {
+      // 简版/AOD 样式：隐藏左右健康数据、电量、气泡和宠物，只保留日期与空心时间。
+      // 这个函数既可能由真实 SCREEN_OFF/SCREEN_AOD 触发，也可能由熄屏前预切触发。
+      // 注意：onHide 不能调用它，因为进入设置/应用也会 onHide，但那不是息屏。
+      this.clearPreSleepTimer()
+      this.isSleeping = true
+      this.isPlaying = false
+      this.screenMode = mode || 'sleep'
+      this.clearFrameTimers()
+      clearTimeout(this.bubbleTimerId)
+      clearTimeout(this.wakeTimerId)
+      this.faceClass = 'face face-sleep'
+      this.timeBlockClass = 'time-block time-block-sleep'
+      this.centerRowClass = 'center-row center-hidden'
+      this.leftMetricClass = 'side-metric metric-left metric-hidden'
+      this.rightMetricClass = 'side-metric metric-right metric-hidden'
+      this.batteryClass = 'battery-pill battery-hidden'
+      this.bubbleClass = 'bubble bubble-hidden'
+      this.talk = ''
+      this.moodText = '睡觉'
+      this.petImage = './assets/pet-sleep-bubble.png'
+      this.minuteKey = ''
+      this.refreshTime()
+    },
+
+    wakeUpPet(source) {
+      // 从睡眠回到亮屏时播放“惊醒 + 泡泡爆开”的帧动画。
+      const self = this
+      if (!this.isSleeping) {
+        return
+      }
+      this.isSleeping = false
+      this.screenMode = 'normal'
+      this.clearFrameTimers()
+      this.faceClass = 'face'
+      this.timeBlockClass = 'time-block'
+      this.centerRowClass = 'center-row'
+      this.leftMetricClass = 'side-metric metric-left'
+      this.rightMetricClass = 'side-metric metric-right'
+      this.batteryClass = 'battery-pill'
+      this.moodText = '惊醒'
+      this.bubbleClass = 'bubble bubble-hidden'
+      this.talk = ''
+      this.minuteKey = ''
+      this.refreshTime()
+      clearTimeout(this.wakeTimerId)
+      // 先播放惊醒帧，再稍微延迟出现气泡文案，避免文字和泡泡爆开动画抢视觉。
+      this.wakeTimerId = setTimeout(function () {
+        self.showBubble('醒啦，继续发光。')
+      }, 390)
+      this.playFrames([
+        './assets/pet-sleep-bubble.png',
+        './assets/pet-wake-1.png',
+        './assets/pet-bubble-pop.png',
+        './assets/pet-wake-2.png',
+        './assets/pet-hop-up.png',
+        './assets/pet-idle.png',
+      ])
+      this.scheduleAmbientPrepare(source || 'wake')
+    },
+
+    randomMode(max) {
+      // 随机互动时避免连续两次抽到同一种动作。
+      let mode = Math.floor(Math.random() * max)
+      if (mode === this.lastMode) {
+        mode = (mode + 1) % max
+      }
+      this.lastMode = mode
+      return mode
+    },
+
+    playMoment(mode) {
+      // mode 决定点击/自动触发时宠物做什么动作。
+      // 每个动作由一组图片帧组成，playFrames 会按时间顺序播放。
+      // 这里再做一层动画锁兜底，防止其他入口绕过 onPetTap 直接调用 playMoment。
+      if (this.isPlaying || this.isSleeping) {
+        return
+      }
+      if (mode === 0) {
+        this.moodText = '蹦跶'
+        this.showBubble('我在表盘里巡逻。')
+        this.playFrames([
+          './assets/pet-idle.png',
+          './assets/pet-hop-mid.png',
+          './assets/pet-happy.png',
+          './assets/pet-hop-up.png',
+          './assets/pet-happy.png',
+          './assets/pet-idle.png',
+        ])
+      } else if (mode === 1) {
+        this.moodText = '跳舞'
+        this.showBubble('噔噔噔，整点快乐。')
+        this.playFrames([
+          './assets/pet-dance.png',
+          './assets/pet-dance-mid.png',
+          './assets/pet-dance-r.png',
+          './assets/pet-dance-mid.png',
+          './assets/pet-dance.png',
+        ])
+      } else if (mode === 2) {
+        this.moodText = '碎碎念'
+        this.showBubble(lines[this.lineIndex % lines.length])
+        this.lineIndex += 1
+        this.playFrames([
+          './assets/pet-talk.png',
+          './assets/pet-talk-mid.png',
+          './assets/pet-talk-open.png',
+          './assets/pet-talk-mid.png',
+          './assets/pet-talk.png',
+        ])
+      } else if (mode === 3) {
+        this.moodText = '犯困'
+        this.showBubble('省电梦境加载中。')
+        // 睡觉动作多放几帧，让眨眼、低头、睡着的过程更完整，不会一下就结束。
+        this.playFrames([
+          './assets/pet-sleep-mid.png',
+          './assets/pet-sleep.png',
+          './assets/pet-sleep-mid.png',
+          './assets/pet-sleep.png',
+          './assets/pet-sleep-bubble.png',
+          './assets/pet-sleep.png',
+          './assets/pet-sleep-bubble.png',
+          './assets/pet-sleep.png',
+          './assets/pet-sleep-mid.png',
+          './assets/pet-idle.png',
+        ])
+      } else {
+        // 最后一种是“偷瞄挠屁股”动作，帧里包含转身和小手上下动。
+        this.moodText = '偷瞄'
+        this.showBubble('偷偷挠挠，别盯太久。')
+        this.playFrames([
+          './assets/pet-back-peek.png',
+          './assets/pet-scratch-a.png',
+          './assets/pet-scratch-c.png',
+          './assets/pet-scratch-b.png',
+          './assets/pet-scratch-c.png',
+          './assets/pet-back-peek.png',
+        ])
+      }
+    },
+
+    playFrames(frames) {
+      // 简单的逐帧动画播放器：把一组图片路径按 180ms 间隔切换到 petImage。
+      const self = this
+      this.clearFrameTimers()
+      this.isPlaying = true
+      frames.forEach(function (frame, index) {
+        const timerId = setTimeout(function () {
+          if (self.isSleeping) {
+            // 进入睡眠后不继续播放普通互动帧，避免睡眠状态被旧动画覆盖。
+            return
+          }
+          self.petImage = frame
+          if (index === frames.length - 1) {
+            const endTimerId = setTimeout(function () {
+              if (self.isSleeping) {
+                return
+              }
+              self.isPlaying = false
+              self.petImage = './assets/pet-idle.png'
+            }, 240)
+            self.frameTimerIds.push(endTimerId)
+          }
+        }, index * 180)
+        self.frameTimerIds.push(timerId)
+      })
+    },
+
+    clearFrameTimers() {
+      // 停掉所有未播放完的帧定时器，防止连续点击导致多组动画互相抢 petImage。
+      for (let i = 0; i < this.frameTimerIds.length; i++) {
+        clearTimeout(this.frameTimerIds[i])
+      }
+      this.frameTimerIds = []
+    },
+
+    showBubble(text) {
+      // 互动气泡：显示 1.6 秒后自动隐藏。普通待机时不显示文字。
+      const self = this
+      this.talk = text
+      this.bubbleClass = 'bubble bubble-show'
+      clearTimeout(this.bubbleTimerId)
+      this.bubbleTimerId = setTimeout(function () {
+        self.bubbleClass = 'bubble bubble-hidden'
+        self.talk = ''
+      }, 2400)
+    },
+
+    pad(value) {
+      // 时间补零：7 -> '07'。
+      return value < 10 ? '0' + value : String(value)
+    },
+
+    clamp(value, min, max) {
+      // 把电量百分比限制在 0-100，避免异常返回导致 UI 出现负数或超过 100%。
+      if (value < min) {
+        return min
+      }
+      if (value > max) {
+        return max
+      }
+      return value
+    },
+
+    trace(label, data) {
+      // 健康/通用调试日志：同时打印到日志面板和屏幕 debug-line。
+      // 真机稳定后可以只保留 console.log，隐藏页面上的 debug-line。
+      const message =
+        'CMM_WF ' +
+        label +
+        (typeof data === 'undefined' ? '' : ' ' + this.safeStringify(data))
+      this.debugText = this.shorten(message, 68)
+      try {
+        if (typeof console !== 'undefined' && console.log) {
+          console.log(message)
+        }
+      } catch (e) {}
+    },
+
+    batteryTrace(text) {
+      // 电量单独加 battery 前缀，方便从日志里区分电量和健康数据。
+      const message = 'CMM_WF battery ' + text
+      this.debugText = this.shorten(message, 68)
+      try {
+        if (typeof console !== 'undefined' && console.log) {
+          console.log(message)
+        }
+      } catch (e) {}
+    },
+
+    safeStringify(value) {
+      // JSON.stringify 可能遇到 undefined/循环对象失败；这里做安全转换。
+      if (typeof value === 'string') {
+        return value
+      }
+      if (typeof value === 'number' || typeof value === 'boolean') {
+        return String(value)
+      }
+      if (value === null || typeof value === 'undefined') {
+        return String(value)
+      }
+      try {
+        return JSON.stringify(value)
+      } catch (e) {
+        return String(value)
+      }
+    },
+
+    describeApi(api) {
+      // 打印模块暴露的方法名，方便判断真机上接口是否存在。
+      const names = []
+      try {
+        for (const key in api) {
+          names.push(key)
+          if (names.length >= 12) {
+            break
+          }
+        }
+      } catch (e) {}
+      return names.join(',')
+    },
+
+    shorten(text, max) {
+      // 屏幕 debug-line 很窄，过长日志截断，完整日志仍会在 console 里。
+      if (!text || text.length <= max) {
+        return text
+      }
+      return text.substring(0, max)
+    },
+  }
+</script>
+
+<style lang="less">
+  .face {
+    width: 466px;
+    height: 466px;
+    flex-direction: column;
+    align-items: center;
+    background-color: #000000;
+  }
+
+  .face-sleep {
+    justify-content: center;
+  }
+
+  .time-block {
+    flex-direction: column;
+    align-items: center;
+    width: 360px;
+    height: 126px;
+    margin-top: 24px;
+  }
+
+  .time-block-sleep {
+    position: absolute;
+    top: 164px;
+    width: 410px;
+    height: 138px;
+    margin-top: 0;
+  }
+
+  .time-row {
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    width: 352px;
+    height: 88px;
+    margin-top: 2px;
+  }
+
+  .time-digit {
+    width: 66px;
+    height: 88px;
+  }
+
+  .time-digit-outline {
+    width: 62px;
+    height: 84px;
+    margin-right: 3px;
+  }
+
+  .time-digit-sleep {
+    width: 67px;
+    height: 91px;
+    margin-right: 4px;
+  }
+
+  .time-colon {
+    width: 26px;
+    height: 78px;
+    font-size: 60px;
+    line-height: 78px;
+    font-weight: bold;
+    color: #ef795b;
+    text-align: center;
+    margin-top: -8px;
+  }
+
+  .date {
+    width: 190px;
+    height: 22px;
+    margin-top: 0;
+    font-size: 18px;
+    color: #fff1df;
+    text-align: center;
+  }
+
+  .face-sleep .time-row {
+    width: 372px;
+    height: 97px;
+    margin-top: 6px;
+  }
+
+  .face-sleep .time-colon {
+    width: 30px;
+    height: 83px;
+    font-size: 63px;
+    line-height: 83px;
+    margin-top: -9px;
+  }
+
+  .face-sleep .date {
+    width: 220px;
+    height: 24px;
+    font-size: 20px;
+  }
+
+  .center-row {
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    width: 430px;
+    height: 218px;
+    margin-top: -8px;
+  }
+
+  .center-hidden {
+    opacity: 0;
+    height: 0;
+    margin-top: 0;
+  }
+
+  .pet-stage {
+    flex-direction: column;
+    align-items: center;
+    width: 224px;
+    height: 210px;
+    margin-left: 2px;
+    margin-right: 2px;
+  }
+
+  .bubble {
+    justify-content: center;
+    align-items: center;
+    width: 214px;
+    height: 46px;
+    border-radius: 14px;
+    background-color: #151515;
+  }
+
+  .bubble-hidden {
+    opacity: 0;
+  }
+
+  .bubble-show {
+    opacity: 1;
+  }
+
+  .bubble-text {
+    width: 190px;
+    height: 32px;
+    font-size: 16px;
+    line-height: 20px;
+    color: #fff1df;
+    text-align: center;
+  }
+
+  .pet-img {
+    width: 190px;
+    height: 132px;
+    margin-top: 12px;
+  }
+
+  .side-metric {
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 74px;
+    height: 66px;
+  }
+
+  .metric-icon {
+    width: 24px;
+    height: 24px;
+  }
+
+  .metric-value {
+    width: 74px;
+    height: 26px;
+    margin-top: 2px;
+    font-size: 20px;
+    font-weight: bold;
+    color: #69e8c9;
+    text-align: center;
+  }
+
+  .metric-hidden {
+    opacity: 0;
+  }
+
+  .battery-pill {
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 70px;
+    height: 58px;
+    margin-top: 0;
+    margin-bottom: 24px;
+  }
+
+  .bottom-spacer {
+    flex: 1;
+    width: 1px;
+  }
+
+  .battery-icon {
+    width: 24px;
+    height: 24px;
+  }
+
+  .battery-value {
+    width: 70px;
+    height: 24px;
+    margin-top: 0;
+    font-size: 20px;
+    font-weight: bold;
+    color: #ef795b;
+    text-align: center;
+  }
+
+  .battery-hidden {
+    opacity: 0;
+  }
+
+  .debug-line {
+    width: 300px;
+    /* height: 18px; */
+    margin-top: -18px;
+    font-size: 13px;
+    color: #fff;
+    text-align: center;
+    position: absolute;
+    top: 300px;
+    left: 40px;
+  }
+
+  @media screen and (device: watch-square) {
+    .face {
+      width: 100%;
+      height: 100%;
+      background-color: #000000;
+    }
+
+    .time-block {
+      margin-top: 16px;
+    }
+
+    .center-row {
+      margin-top: -12px;
+    }
+
+    .battery-pill {
+      margin-top: 0;
+      margin-bottom: 32px;
+    }
+  }
+</style>

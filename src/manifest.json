@@ -1,0 +1,79 @@
+{
+  "package": "com.smilelee.chengmama",
+  "versionName": "1.0.0",
+  "versionCode": 28,
+  "appCategory": [
+    "other"
+  ],
+  "permissions": [
+    { "name": "watch.permission.READ_HEALTH_DATA" }
+  ],
+  "features": [
+    {
+      "name": "system.battery"
+    },
+    {
+      "name": "blueos.hardware.battery"
+    },
+    {
+      "name": "blueos.health.health"
+    },
+    {
+      "name": "blueos.hardware.display.screen"
+    },
+    {
+      "name": "blueos.hardware.display.brightness"
+    },
+    {
+      "name": "blueos.app.event.eventManager"
+    }
+  ],
+  "config": {
+    "designWidth": 466
+  },
+  "deviceTypeList": [
+    "watch-round",
+    "watch-square"
+  ],
+  "router": {
+    "entry": "watch3001",
+    "watchfaces": {
+      "watch3001": {
+        "id": 3001,
+        "name": "橙码码动态表盘",
+        "component": "index",
+        "edit": "edit",
+        "features": [
+          {
+            "name": "blueos.app.appmanager.router"
+          },
+          {
+            "name": "system.battery"
+          },
+          {
+            "name": "blueos.hardware.battery"
+          },
+          {
+            "name": "blueos.health.health"
+          },
+          {
+            "name": "blueos.hardware.display.screen"
+          },
+          {
+            "name": "blueos.hardware.display.brightness"
+          },
+          {
+            "name": "blueos.app.event.eventManager"
+          }
+        ],
+        "params": {
+          "previewImage": [
+            "watch3001/assets/3001.png"
+          ],
+          "hpw": 0
+        }
+      }
+    }
+  },
+  "name": "橙码码表盘"
+}

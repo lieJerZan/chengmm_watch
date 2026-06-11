@@ -1,0 +1,16 @@
+node_modules
+build*
+!build.config.js
+dist
+sign
+
+.idea
+.DS_Store
+.ide/settings.json
+
+watchfaces*
+org.vivowatch.union.watch.sample
+.vscode
+.preview.json
+
+yarn-error.log

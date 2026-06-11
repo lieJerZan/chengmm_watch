@@ -1,0 +1,26 @@
+<template>
+  <div class="wrap">
+    <div class="container">
+      <text>{{name}}</text>
+    </div>
+  </div>
+</template>
+<script>
+  export default {
+    data() {
+      return {
+        name: "edit.ux"
+      }
+    },
+    onInit() {
+      console.log(`inside edit`)
+    },
+
+  }
+</script>
+<style lang="less">
+  .wrap{
+    width: 466px;
+    height: 466px;
+  }
+</style>
